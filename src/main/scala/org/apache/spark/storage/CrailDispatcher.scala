@@ -55,15 +55,11 @@ class CrailDispatcher () extends Logging {
   val serializer = SparkEnv.get.serializer
 
   val rootDir = "/spark"
-  val broadcastDir = rootDir + "/broadcast"
-  val shuffleDir = rootDir + "/shuffle"
-  val rddDir = rootDir + "/rdd"
-  val tmpDir = rootDir + "/tmp"
-  val metaDir = rootDir + "/meta"
-  val hostsDir = metaDir + "/hosts"
+  val appDir = rootDir + "/" + appId
+  val broadcastDir = appDir + "/broadcast"
+  val shuffleDir = appDir + "/shuffle"
 
   var deleteOnClose : Boolean = _
-  var deleteOnStart : Boolean = _
   var preallocate : Int = 0
   var writeAhead : Long = _
   var debug : Boolean = _
@@ -91,10 +87,9 @@ class CrailDispatcher () extends Logging {
 
 
   private def init(): Unit = {
-    logInfo("CrailStore starting version 400")
+    logInfo("CrailStore starting version 401")
 
-    deleteOnClose = conf.getBoolean("spark.crail.deleteonclose", false)
-    deleteOnStart = conf.getBoolean("spark.crail.deleteonstart", true)
+    deleteOnClose = conf.getBoolean("spark.crail.deleteonclose", true)
     preallocate = conf.getInt("spark.crail.preallocate", 0)
     writeAhead = conf.getLong("spark.crail.writeAhead", 0)
     debug = conf.getBoolean("spark.crail.debug", false)
@@ -106,7 +101,6 @@ class CrailDispatcher () extends Logging {
     broadcastStorageClass = CrailStorageClass.get(conf.getInt("spark.crail.broadcast.storageclass", 0))
 
     logInfo("spark.crail.deleteonclose " + deleteOnClose)
-    logInfo("spark.crail.deleteOnStart " + deleteOnStart)
     logInfo("spark.crail.preallocate " + preallocate)
     logInfo("spark.crail.writeAhead " + writeAhead)
     logInfo("spark.crail.debug " + debug)
@@ -126,67 +120,25 @@ class CrailDispatcher () extends Logging {
       localLocationClass = fs.getLocationClass()
     }
 
-    if (executorId == "driver"){
-      logInfo("creating main dir " + rootDir)
-      val baseDirExists : Boolean = fs.lookup(rootDir).get() != null
-
-      if (!baseDirExists || deleteOnStart){
+    if (executorId == "driver") {
+      val baseDirExists: Boolean = fs.lookup(rootDir).get() != null
+      if (!baseDirExists) {
         logInfo("creating main dir " + rootDir)
-        if (baseDirExists){
-          fs.delete(rootDir, true).get().syncDir()
-        }
         fs.create(rootDir, CrailNodeType.DIRECTORY, CrailStorageClass.DEFAULT, CrailLocationClass.DEFAULT, true).get().syncDir()
-        fs.create(broadcastDir, CrailNodeType.DIRECTORY, CrailStorageClass.DEFAULT, CrailLocationClass.DEFAULT, true).get().syncDir()
-        fs.create(shuffleDir, CrailNodeType.DIRECTORY, shuffleStorageClass, CrailLocationClass.DEFAULT, true).get().syncDir()
-        fs.create(rddDir, CrailNodeType.DIRECTORY, CrailStorageClass.DEFAULT, CrailLocationClass.DEFAULT, true).get().syncDir()
-        fs.create(tmpDir, CrailNodeType.DIRECTORY, CrailStorageClass.DEFAULT, CrailLocationClass.DEFAULT, true).get().syncDir()
-        fs.create(metaDir, CrailNodeType.DIRECTORY, CrailStorageClass.DEFAULT, CrailLocationClass.DEFAULT, true).get().syncDir()
-        fs.create(hostsDir, CrailNodeType.DIRECTORY, CrailStorageClass.DEFAULT, CrailLocationClass.DEFAULT, true).get().syncDir()
-        logInfo("creating main dir done " + rootDir)
       }
+
+      val appDirExists = fs.lookup(appDir).get() != null
+      if (appDirExists) {
+        throw new IllegalStateException("Shuffle application directory with id " + appId +
+          " already exists")
+      }
+      fs.create(appDir, CrailNodeType.DIRECTORY, CrailStorageClass.DEFAULT, CrailLocationClass.DEFAULT, true).get().syncDir()
+      fs.create(broadcastDir, CrailNodeType.DIRECTORY, CrailStorageClass.DEFAULT, CrailLocationClass.DEFAULT, true).get().syncDir()
+      fs.create(shuffleDir, CrailNodeType.DIRECTORY, shuffleStorageClass, CrailLocationClass.DEFAULT, true).get().syncDir()
+      logInfo("creating main dir done " + rootDir)
     }
 
-    try {
-      val hostFile = hostsDir + "/" + fs.getLocationClass().value();
-      logInfo("creating hostFile " + hostFile)
-      fs.create(hostFile, CrailNodeType.DATAFILE, CrailStorageClass.DEFAULT, CrailLocationClass.DEFAULT, true).get().syncDir()
-      logInfo("creating hostFile done " + hostFile)
-    } catch {
-      case e: Exception =>
-        logInfo("exception e " + e.getMessage)
-        e.printStackTrace()
-    }
-
-    try {
-      logInfo("buffer cache warmup ")
-      val tmpFile = tmpDir + "/" + Random.nextDouble()
-      var file = fs.create(tmpFile, CrailNodeType.DATAFILE, CrailStorageClass.DEFAULT, CrailLocationClass.DEFAULT, true).get().asFile()
-      file.syncDir()
-      var fileStream = file.getDirectOutputStream(0)
-      val bufferQueue = new LinkedBlockingQueue[CrailBuffer]
-      var i = 0
-      while ( i < preallocate){
-        var buf = fs.allocateBuffer()
-        bufferQueue.add(buf)
-        i+=1
-      }
-      var buf = bufferQueue.poll()
-      while (buf != null){
-        buf.clear()
-        fileStream.write(buf).get()
-        fs.freeBuffer(buf)
-        buf = bufferQueue.poll()
-      }
-      fileStream.close()
-      fs.delete(tmpFile, false).get().syncDir()
-      logInfo("buffer cache warmup done ")
-    } catch {
-      case e: Exception =>
-        logInfo("exception e " + e.getMessage)
-        e.printStackTrace()
-    }
-
-    fs.getStatistics.print("init")
+    fs.getStatistics.print(appId + " init")
     fs.getStatistics.reset()
   }
 
@@ -397,7 +349,7 @@ class CrailDispatcher () extends Logging {
     if (fs != null){
       if (executorId == "driver"){
         if (deleteOnClose){
-          fs.delete(rootDir, true).get()
+          fs.delete(appDir, true).get()
         }
       }
 
@@ -405,15 +357,14 @@ class CrailDispatcher () extends Logging {
         //request by map task, if first (still in reduce state) then print reduce stats
         isMap.synchronized(
           if (isMap.get()){
-            fs.getStatistics.print("map")
+            fs.getStatistics.print(appId + " map")
           } else {
-            fs.getStatistics.print("reduce")
+            fs.getStatistics.print(appId + " reduce")
           }
         )
       }
 
-      fs.close()
-      fs.getStatistics.print("close")
+      fs.getStatistics.print(appId + " close")
     }
   }
 
@@ -533,13 +484,13 @@ class CrailDispatcher () extends Logging {
   }
 
   private def getPath(blockId: BlockId): String = {
-    var name = tmpDir + "/" + blockId.name
-    if (blockId.isBroadcast){
+    var name : String = ""
+    if (blockId.isBroadcast) {
       name = broadcastDir + "/" + blockId.name
-    } else if (blockId.isShuffle){
+    } else if (blockId.isShuffle) {
       name = shuffleDir + "/" + blockId.name
-    } else if (blockId.isRDD){
-      name = rddDir + "/" + blockId.name
+    }  else {
+      throw new IllegalArgumentException("unsupported block type")
     }
     return name
   }
